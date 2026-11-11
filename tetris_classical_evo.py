@@ -11,6 +11,7 @@ import numpy as np
 from nes_tetris import NESTetris
 
 SEED = 67
+rng = np.random.default_rng(67)
 
 # ----------------------------------------------------------------------------
 # MUTATION LOGIC - Currently set to be totally random, but has capability to enter target_column decisions 
@@ -85,7 +86,7 @@ def choose_moves(state):
 class Individual_Game:
     
     def __init__(self, game, strategy):
-        self.game = game
+        self.game = copy.deepcopy(game)
         self.state = self.game.get_state()
         self.genome = choose_moves(self.state)
         self.fitness = 0
@@ -104,18 +105,28 @@ class Individual_Strategizer:
     def __init__(self, game):
         # negative/positive direction = number of inputs left/right 
         # negative/positive rotation = number of rotations clockwise/counterclockwise
-        self.initial_state = game.get_state()
+        self.game = copy.deepcopy(game) # FIX: own copy, so building strategizers doesn't drop pieces on the shared start board
+        self.record_initial()
+ 
+        # flat board, prioritize reducing height (bounds picked on whim)
+        self.pick_strategy()
+        self.fitness = 0
+ 
+    def record_initial(self):
+        self.initial_state = self.game.get_state()
         self.initial_heights = self.initial_state["column_heights"]
         self.initial_var = np.var(self.initial_heights)
         self.initial_avg = np.mean(self.initial_heights)
-
-        # flat board, prioritize reducing height (bounds picked on whim)
-        self.pick_strategy()
-        self.genome = evolutionary_controller(game, self.strategy) # genome becomes best board at end of controller session
-        self.fitness = 0
+ 
+    def play(self):
+        # FIX: the controller session used to run only once, in __init__, so later generations
+        # (and strategy flips) never played anything. Now it runs every generation, from this
+        # strategizer's current board, with its current strategy.
+        self.record_initial()
+        self.game = evolutionary_controller(self.game, self.strategy)[1] # genome becomes best board at end of controller session
         
     def eval_fitness(self):
-        post_state = self.genome.get_state()
+        post_state = self.game.get_state()
         post_heights = post_state["column_heights"]
         post_var = np.var(post_heights)
         post_avg = np.mean(post_heights)
@@ -124,14 +135,14 @@ class Individual_Strategizer:
         # TODO: introduce loss function with true weighting opposed to if/else calculating fitness
             # then change weights based on strategy
         # inverted fitness - lower fitness = more fit
-        if self.strategy == "height":
+        if self.strategy != "height":
             self.fitness = post_var - self.initial_var # lower final varianced compared to inital is more fit 
         else:
             self.fitness = post_avg - self.initial_avg
 
     # TODO: hook in tactician to pick_strategy function
     def pick_strategy(self):
-        if self.inital_var < 1:
+        if self.initial_var < 1:
             self.strategy = "height"
         # noisy board, prioritize reducing variance
         else:
@@ -144,11 +155,6 @@ def evolutionary_controller(game=None, strategy="height"):
     total_generations=20; num_parents=10; num_children=10;
     tournament_size=4; num_tournament_winners=2;
 
-    # checks for passed in game, assumes new board otherwise
-    if not game:
-        game = NESTetris(seed=SEED)
-
-
     # initialize record keeping
     solution = None # best genome so far
     solution_fitness = 99999 # fitness of best genome so far
@@ -159,7 +165,7 @@ def evolutionary_controller(game=None, strategy="height"):
     # the initialization proceedure
     population = [] # keep population of individuals in a list
     for i in range(num_parents): # only create parents for initialization (the mu in mu+lambda)
-        population.append(Individual_Game(game)) # generate new random individuals as parents
+        population.append(Individual_Game(game, strategy)) # generate new random individuals as parents
     
     # get population fitness
     for i in range(len(population)):
@@ -173,7 +179,7 @@ def evolutionary_controller(game=None, strategy="height"):
         while len(new_children) < num_children:
             
             # inheretance
-            [parent1, parent2] = np.random.choice(population, size=2) # pick 2 random parents
+            [parent1, parent2] = rng.choice(population, size=2) # pick 2 random parents
             child1 = copy.deepcopy(parent1) # initialize children as perfect copies of their parents
             child2 = copy.deepcopy(parent2)
             
@@ -198,7 +204,7 @@ def evolutionary_controller(game=None, strategy="height"):
         new_population = []
         new_population.append(population[0])
         while len(new_population) < num_parents:
-            tournament = np.random.choice(population, size=tournament_size, replace=False)
+            tournament = rng.choice(population, size=tournament_size, replace=False)
             tournament = sorted(tournament, key=lambda individual: individual.fitness) # reverse equals false, as lowest fitness values should win
             new_population.extend(tournament[:num_tournament_winners])    
         population = new_population
@@ -227,14 +233,16 @@ def evolutionary_strategizer(total_generations=10, num_parents=20, num_children=
     fitness_over_time = np.zeros(total_generations)
     solutions_over_time = []
     diversity_over_time = np.zeros(total_generations)
+    game = NESTetris(seed=SEED)
     
     # the initialization proceedure
     population = [] # keep population of individuals in a list
     for i in range(num_parents): # only create parents for initialization (the mu in mu+lambda)
-        population.append(Individual_Strategizer()) # generate new random individuals as parents
+        population.append(Individual_Strategizer(game)) # generate new random individuals as parents
     
     # get population fitness
     for i in range(len(population)):
+        population[i].play()
         population[i].eval_fitness() # evaluate the fitness of each parent
 
     # total_generations in this case refers to as pieces to iterate through
@@ -245,7 +253,7 @@ def evolutionary_strategizer(total_generations=10, num_parents=20, num_children=
         while len(new_children) < num_children:
             
             # inheretance
-            [parent1, parent2] = np.random.choice(population, size=2) # pick 2 random parents
+            [parent1, parent2] = rng.choice(population, size=2) # pick 2 random parents
             child1 = copy.deepcopy(parent1) # initialize children as perfect copies of their parents
             child2 = copy.deepcopy(parent2)
             
@@ -256,7 +264,7 @@ def evolutionary_strategizer(total_generations=10, num_parents=20, num_children=
                 # randomly select few children to flip strategy
                 # TODO: punish in tactician if alternative strategy out performs chosen strategy
             for this_child in [child1,child2]:
-                if np.random.rand() <= 0.25:
+                if rng.random() <= 0.25:
                     if this_child.strategy == "height":
                         this_child.strategy = "variance"
                     else:
@@ -266,27 +274,28 @@ def evolutionary_strategizer(total_generations=10, num_parents=20, num_children=
             
         # the assessement procedure
         for i in range(len(new_children)):
+            new_children[i].play()
             new_children[i].eval_fitness() # assign fitness to each child and continue game
 
         # selection procedure
         population = new_children   # only children survive: every survivor dropped this generation's piece
-        population = sorted(population, key=lambda individual: individual.fitness, reverse=True) # sort the full population by each individual's fitness (from highers to lowest)
+        population = sorted(population, key=lambda individual: individual.fitness) # sort the full population by each individual's fitness (from highers to lowest)
         
         # tournament selection
         new_population = []
         new_population.append(population[0])
         while len(new_population) < num_parents:
-            tournament = np.random.choice(population, size=tournament_size, replace=False)
+            tournament = rng.choice(population, size=tournament_size, replace=False)
             tournament = sorted(tournament, key=lambda individual: individual.fitness) # reverse equals false, as lowest fitness values should win
             new_population.extend(tournament[:num_tournament_winners])    
         population = new_population
         
         # record keeping
         
-        solution = population[0].game.render_text()                 # update best solution records
+        game = population[0].game                             # update starting board
         solution_fitness = population[0].fitness
         fitness_over_time[generation_num] = solution_fitness # record the fitness of the current best over evolutionary time
-        solutions_over_time.append(population[0].game.render_text())
+        solutions_over_time.append(game.render_text())
         
         
         # removed diversity as this implementation doesnt apply, also not needed for this version
@@ -294,7 +303,7 @@ def evolutionary_strategizer(total_generations=10, num_parents=20, num_children=
         
     return solutions_over_time, population[0].game
 
-sot, game = evolutionary_controller()
+sot, game = evolutionary_strategizer()
 
 for sol in sot:
     print(sol)
