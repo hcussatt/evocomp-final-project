@@ -1,5 +1,5 @@
 """
-nes_tetris.py — drive the real NES Tetris ROM headlessly for evolutionary computation.
+nes_tetris.py — run NES Tetris headlessly or watch the original NES graphics.
 
 Runs the original 1989 NES Tetris in the nes-py emulator (via gym-tetris, which ships
 the ROM) and exposes what an EC loop needs:
@@ -17,6 +17,14 @@ Conventions
 - rotation = number of clockwise (A button) presses from the spawn orientation, 0-3
 - x       = the piece's pivot column (0-9) as stored by the game at RAM $0040
 - Board row 0 is the top, row 19 the bottom; heights count up from the floor.
+
+Usage:
+  python nes_tetris.py                   # headless, fastest
+  python nes_tetris.py --render          # watch the original NES graphics
+  python nes_tetris.py --render --fps 120 --pieces 50
+
+In your own Python code, use NESTetris(render=True), and call
+set_render(False) or set_render(True) to switch at runtime.
 
 Install:  pip install gym-tetris   (brings nes-py and the ROM)
   Python 3.13+ gets gym-tetris 4.x (recommended). On older Python pip installs the
@@ -36,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import io
+import time
 
 import numpy as np
 
@@ -107,12 +116,33 @@ def _rom_owner_after_reset(env):
 
 
 class NESTetris:
-    """Headless NES Tetris with column-height readout and turn-level control."""
+    """NES Tetris with optional live graphics and turn-level control."""
 
     MAX_WAIT_FRAMES = 3000  # safety bound for any wait loop
 
-    def __init__(self, seed: int | None = None, level: int = 0):
-        self.env = _GymTetris(deterministic=False)
+    def __init__(self, seed: int | None = None, level: int = 0,
+                 render: bool = False, render_fps: float = 60,
+                 render_scale: int = 3):
+        """Create the game. Set render=True to watch the original NES screen.
+
+        render_fps=60 runs at the NES's normal speed; 0 removes the FPS cap.
+        render_scale changes the initial window size (e.g., 3 = 768x720).
+        None of these options change the game logic in headless mode.
+        """
+        if render_fps < 0:
+            raise ValueError("render_fps must be nonnegative (0 means uncapped)")
+        if render_scale < 1:
+            raise ValueError("render_scale must be at least 1")
+        self.render_enabled = bool(render)
+        self.render_fps = render_fps
+        self.render_scale = int(render_scale)
+        self._next_render_time = None
+        self._render_scaled = False
+        # nes-py 9+ uses render_mode at creation; nes-py 8 uses render(mode=...).
+        options = {} if LEGACY_STACK else {
+            "render_mode": "human" if render else None
+        }
+        self.env = _GymTetris(deterministic=False, **options)
         if not LEGACY_STACK and NESTetris._BOOT is None:
             # A private emulator holding the post-title-screen state that reset()
             # returns to, so copies made with copy.deepcopy() can reset() too.
@@ -121,6 +151,51 @@ class NESTetris:
             NESTetris._BOOT, NESTetris._BOOT_OWNER = owner.dump_state(), owner
         self.level_start = level
         self.reset(seed)
+
+    # ---------------------------------------------------------- live graphics
+    def set_render(self, enabled: bool, fps: float | None = None):
+        """Turn the viewer on/off while the game is running.
+
+        Only call on the main thread; the NES viewer uses pyglet/OpenGL.
+        """
+        if fps is not None:
+            if fps < 0:
+                raise ValueError("fps must be nonnegative")
+            self.render_fps = fps
+        self.render_enabled = bool(enabled)
+        self._next_render_time = None
+        if not LEGACY_STACK:
+            self.env.render_mode = "human" if enabled else None
+        if enabled:
+            self._show_frame()
+        else:
+            viewer = getattr(self.env, "viewer", None)
+            if viewer is not None:
+                viewer.close()
+                self.env.viewer = None
+            self._render_scaled = False
+
+    def _show_frame(self):
+        """Show one actual emulator frame; completely skipped when headless."""
+        if not self.render_enabled:
+            return
+        if self.render_fps > 0:
+            now = time.perf_counter()
+            if self._next_render_time is not None and now < self._next_render_time:
+                time.sleep(self._next_render_time - now)
+            self._next_render_time = time.perf_counter() + 1 / self.render_fps
+        if LEGACY_STACK:
+            self.env.render(mode="human")
+        else:
+            self.env.render()
+        # The nes-py viewer defaults to 256x240. Enlarge the window once;
+        # its image blitter automatically scales subsequent frames.
+        if not self._render_scaled:
+            viewer = getattr(self.env, "viewer", None)
+            window = getattr(viewer, "_window", None)
+            if window is not None:
+                window.set_size(256 * self.render_scale, 240 * self.render_scale)
+            self._render_scaled = True
 
     # ------------------------------------------------------------------ setup
     def reset(self, seed: int | None = None):
@@ -132,7 +207,9 @@ class NESTetris:
             self._poke(0x64, self.level_start)
         self.frames = 0
         self.pieces_placed = 0
+        self._next_render_time = None
         self._wait_for_control()
+        self._show_frame()
         return self.get_state()
 
     # ----------------------------------------------------------- RAM helpers
@@ -231,6 +308,7 @@ class NESTetris:
             mask |= BTN[b]
         self.env._frame_advance(mask)
         self.frames += 1
+        self._show_frame()
 
     def tap(self, action: str):
         """One tap = 1 frame pressed + 1 frame released (NES reads new presses).
@@ -387,6 +465,7 @@ class NESTetris:
         state, self.frames, self.pieces_placed, owner = snap
         self.env.load_state(state)
         self.env._rom_owner = owner   # see _rom_owner() below
+        self._show_frame()
 
     _BOOT = None        # shared post-title-screen emulator state (see __init__)
     _BOOT_OWNER = None  # the private emulator that state came from
@@ -415,6 +494,12 @@ class NESTetris:
         new.level_start = self.level_start
         new.frames = self.frames
         new.pieces_placed = self.pieces_placed
+        # Clones are simulation workers, not additional GUI windows.
+        new.render_enabled = False
+        new.render_fps = self.render_fps
+        new.render_scale = self.render_scale
+        new._next_render_time = None
+        new._render_scaled = False
         memo[id(self)] = new
         return new
 
@@ -468,15 +553,40 @@ def evaluate_genome(weights: dict, seed: int = 0, max_pieces: int = 300,
 
 
 if __name__ == "__main__":
-    import time
-    g = NESTetris(seed=1)
-    print("current:", g.current_piece, "next:", g.next_piece)
-    g.play_moves(["cw", "left", "left", "left"])
-    g.place(rotation=0, x=7)
-    print(g.render_text())
-    print("column heights:", g.column_heights().tolist())
+    import argparse
 
-    w = {"aggregate_height": -0.51, "lines": 0.76, "holes": -0.36, "bumpiness": -0.18}
-    t = time.time()
-    print("greedy agent:", evaluate_genome(w, seed=3, max_pieces=200),
-          f"{time.time() - t:.1f}s")
+    parser = argparse.ArgumentParser(description="NES Tetris (headless or graphical)")
+    parser.add_argument("--render", action="store_true",
+                        help="show the original NES game while the agent plays")
+    parser.add_argument("--fps", type=float, default=60,
+                        help="viewer FPS (60 = normal speed; 0 = uncapped)")
+    parser.add_argument("--scale", type=int, default=3,
+                        help="initial viewer window size multiplier (default: 3)")
+    parser.add_argument("--pieces", type=int, default=200,
+                        help="maximum pieces for the greedy example")
+    parser.add_argument("--seed", type=int, default=3,
+                        help="random seed for the greedy example")
+    args = parser.parse_args()
+
+    if args.fps < 0 or args.scale < 1 or args.pieces < 1:
+        parser.error("fps must be >= 0, scale >= 1, and pieces >= 1")
+
+    w = {"aggregate_height": -0.51, "lines": 0.76, "holes": -0.36,
+         "bumpiness": -0.18}
+    g = NESTetris(seed=args.seed, render=args.render,
+                  render_fps=args.fps, render_scale=args.scale)
+    try:
+        print("current:", g.current_piece, "next:", g.next_piece)
+        start = time.time()
+        result = evaluate_genome(w, seed=args.seed, max_pieces=args.pieces, game=g)
+        print("greedy agent:", result, f"{time.time() - start:.1f}s")
+        if args.render:
+            try:
+                input("Finished. Press Enter to close the NES window... ")
+            except EOFError:
+                pass
+        else:
+            print(g.render_text())
+            print("column heights:", g.column_heights().tolist())
+    finally:
+        g.close()
